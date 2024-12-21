@@ -20,35 +20,25 @@ class LoadDatasetOutput:
     data: Dataset
     label: ClassLabel
     template: Union[List[str], str]
+    
+    def __init__(self, data: Dataset, label: ClassLabel, template: Union[List[str], str]):
+        self.data = data
+        self.label = label
+        self.template = template
+    def __iter__(self):
+        return iter([self.data, self.label, self.template])
 
-def AutoDataset(dataset_name):
+def AutoDataset(dataset_name: str) -> LoadDatasetOutput:
     data = load_dataset(DATASET_NAME_TO_HUBADDR[dataset_name])
-
-    @lru_cache()
-    def find_labels(dataset: Dataset) -> ClassLabel:
-        if dataset.hasattr("info"):
-            if dataset.info.hasattr("label"):
-                return dataset.info.label
-            elif dataset.info.hasattr("features"):
-                if dataset.info.features.hasattr("label"):
-                    return dataset.info.features.label
-            else:
-                raise NotImplementedError
-        else: 
-            if dataset.hasattr("train"):
-                return find_labels(dataset["train"])
-            elif dataset.hasattr("validation"):
-                return find_labels(dataset["validation"])
-            elif dataset.hasattr("test"):
-                return find_labels(dataset["test"])
-            elif dataset.hasattr("val"):
-                return find_labels(dataset["val"])
-            else:
-                raise NotImplementedError
+    # [TODO] need a better way to find labels
+    def find_labels(ds: Dataset) -> ClassLabel:
+        return ds["train"].info.features["label"]
 
     label = find_labels(data)
     template = DATASET_NAME_TO_TEMPLATE[dataset_name]
+    data = data["validation"]
     
+    print(f"Dataset: {dataset_name} Loaded")
     return LoadDatasetOutput(
         data=data,
         label=label,
