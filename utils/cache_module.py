@@ -3,7 +3,6 @@ import yaml
 import torch
 from typing import List, Union
 from collections import OrderedDict
-import warnings
 
 class CacheModule:
     pos_enabled: bool
@@ -27,6 +26,7 @@ class CacheModule:
         self.neg_enabled = neg_enabled
         self.pos_cache = OrderedDict()
         self.neg_cache = OrderedDict()
+        self.tick = 0
     
     def __str__(self):
         return f"CacheModule(pos_enabled={self.pos_enabled}, neg_enabled={self.neg_enabled})\n" + \
@@ -43,6 +43,7 @@ class CacheModule:
             neg_enabled=config['negative']['enabled']
         )
 
+    @torch.no_grad()
     def update_cache(
         self, 
         cache: OrderedDict,
@@ -57,17 +58,19 @@ class CacheModule:
         r"""
             Update cache with new features and loss, maintaining the maximum shot capacity.
         """
-        batch_size = pred.shape[0]
-        for i in range(batch_size):
-            pred = pred[i].item()
-            if pred not in cache:
-                cache[pred] = PriorityQueue(maxsize=cache_params["shot_capacity"] + 1)
-            # save less loss
-            item = (-loss[i], image_features[i]) if not include_prob_map else (-loss[i], image_features[i], prob_map[i])
-            cache[pred].put(item)
-            if cache[pred].full():
-                # pop the biggest loss
-                cache[pred].get() # ensure cache size is always less than or equal to shot_capacity
+        with torch.no_grad():
+            batch_size = pred.shape[0]
+            for i in range(batch_size):
+                pred = pred[i].item()
+                if pred not in cache:
+                    cache[pred] = PriorityQueue(maxsize=cache_params["shot_capacity"] + 1)
+                # save less loss
+                item = (-loss[i].item(), self.tick, image_features[i]) if not include_prob_map else (-loss[i].item(), self.tick, image_features[i], prob_map[i])
+                self.tick += 1
+                cache[pred].put(item)
+                if cache[pred].full():
+                    # pop the biggest loss
+                    cache[pred].get() # ensure cache size is always less than or equal to shot_capacity
         
     def update_pos_cache(
         self, 
@@ -91,9 +94,9 @@ class CacheModule:
             lo = self.neg_params['entropy_threshold']['lower']
             hi = self.neg_params['entropy_threshold']['upper']
             
-            if prop_entropy < lo or prop_entropy > hi:
+            if prop_entropy > lo and prop_entropy < hi:
                 self.update_cache(self.neg_cache, pred, image_features, loss, include_prob_map, prob_map, cache_params=self.neg_params)
-        
+    
     def _compute_extra_logits_with_cache(
         self, 
         image_features: torch.Tensor,
@@ -105,38 +108,40 @@ class CacheModule:
         r"""
             Compute similarity logits with cache, for all the samples in the cache
         """
-        with torch.amp.autocast(device_type=image_features.device.type):
+        with torch.no_grad():
             cache_keys, cache_values = [], []
             for cls_idx in sorted(cache.keys()):
                 for item in cache[cls_idx].queue:
                     # extract image features
-                    cache_keys.append(item[1]) # see update_cache, 1 x embedding_size
+                    cache_keys.append(item[2]) # see update_cache, 1 x embedding_size
                     if mask_thresholds:
                         # prob_map
                         # print(item[2].shape)
-                        cache_values.append(item[2]) # 1 x num_classes,
+                        cache_values.append(item[3]) # 1 x num_classes,
                     else:
                         cache_values.append(cls_idx)
             
+            data_dtype = image_features.dtype
             cache_keys = torch.stack(cache_keys, dim=0).to(image_features.device) # sample_size x embedding_size
             assert len(cache_keys.shape) == 2, "Cache keys shape mismatch"
             if mask_thresholds:
                 cache_values = torch.stack(cache_values, dim=0) # sample_size x num_classes
-                cache_values = (
+                cache_values = ((
                     (cache_values > mask_thresholds[0]) & 
                     (cache_values < mask_thresholds[1])
-                ).type(torch.int8).to(image_features.device).half() # sample_size x num_classes
+                ).type(torch.int8)).to(image_features.device).to(data_dtype) # sample_size x num_classes
             else:
                 cache_values = torch.nn.functional.one_hot(
                     torch.tensor(cache_values).to(torch.int64), num_classes
-                ).to(image_features.device).half() # sample_size x num_classes
+                ).to(image_features.device).to(data_dtype) # sample_size x num_classes
+                assert len(cache_values.shape) == 2, "Cache values shape mismatch"
             
             affinity = image_features @ cache_keys.T # batch_size x sample_size
             
             alpha, beta = cache_params['alpha'], cache_params['beta']
-            cache_logits = ((-1) * (beta - beta * affinity).exp()) @ cache_values
-        
-        return alpha * cache_logits
+            cache_logits = ((-1) * (beta - beta * affinity)).exp() @ cache_values
+            
+            return alpha * cache_logits
         
     def compute_pos_logits(
         self, 

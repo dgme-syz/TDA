@@ -1,18 +1,20 @@
 import argparse
 import torch
 from typing import Union, List
-from transformers import CLIPModel, CLIPProcessor
+from transformers import CLIPModel, CLIPProcessor, CLIPImageProcessor
 from data_modules import AutoDataset
-from utils import extract_clip_text_weights, eval, CacheModule
+from utils.tools import extract_clip_text_weights, eval
+from utils import CacheModule
 
 
+seed = 1
 def main(args):
     model = CLIPModel.from_pretrained(
-        "openai/clip-vit-base-patch16", device_map="auto", torch_dtype="auto")
+        "openai/clip-vit-base-patch16", device_map="auto", torch_dtype=torch.bfloat16).eval()
     processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch16")
-    cache = CacheModule.load_from_yaml(args.cache_config)
+    cache = CacheModule.load_from_yaml(args.cache_config)   
     print(cache)
-    torch.manual_seed(42)
+    torch.manual_seed(seed)
     
     # Eval
     for dataset_name in args.dataset:
@@ -22,6 +24,7 @@ def main(args):
         )
         
         data, label, template = AutoDataset(dataset_name)
+        data = data.shuffle(seed)
         clip_weights = extract_clip_text_weights(
             class_label=label, template=template, clip_model=model, processor=processor
         )
@@ -45,13 +48,13 @@ def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--dataset", 
-        default="food101", 
+        default="imagenet_a", 
         help="Dataset name or list of dataset names"
     )
     
     parser.add_argument(
         "--cache_config", 
-        default="./configs/food101.yaml", 
+        default="./configs/imagenet_a.yaml", 
         help="Path to cache configuration file"
     )
     
