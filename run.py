@@ -10,7 +10,7 @@ from utils import CacheModule
 seed = 1
 def main(args):
     model = CLIPModel.from_pretrained(
-        "openai/clip-vit-base-patch16", device_map="auto", torch_dtype=torch.bfloat16).eval()
+        "openai/clip-vit-base-patch16", device_map="auto", torch_dtype=torch.bfloat16, attn_implementation="flash_attention_2").eval()
     processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch16")
     cache = CacheModule.load_from_yaml(args.cache_config)   
     print(cache)

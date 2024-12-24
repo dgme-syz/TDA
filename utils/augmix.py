@@ -146,7 +146,7 @@ augmentations_all = [
 
 import torch
 from torchvision import transforms
-from transformers import CLIPProcessor
+from concurrent.futures import ThreadPoolExecutor
 
 def _convert_image_to_rgb(image):
     return image.convert("RGB")
@@ -194,9 +194,12 @@ class AugMixAugmenter(object):
         image = self.preprocess(self.base_transform(x))
         if len(self.aug_list) == 0:
             return [image]
-        views = [augmix(x, self.preprocess, self.aug_list, self.severity) for _ in range(self.n_views)]
-
-        # print([image] + views, "augmix views")
+        # 使用多线程        
+        def gen(x):
+            return augmix(x, self.preprocess, self.aug_list, self.severity)
+        
+        with ThreadPoolExecutor() as executor:
+            views = list(executor.map(gen, [x for _ in range(self.n_views)]))
         return [image] + views
     
 try:

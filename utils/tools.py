@@ -57,7 +57,7 @@ def softmax_entropy(x: torch.Tensor):
 def avg_entropy(x: torch.Tensor):
     # x: batch_size x num_classes
     batch_size = x.shape[0]
-    logits = x.log_softmax(dim=-1) # batch_size x num_classes
+    logits = x - x.logsumexp(dim=-1, keepdim=True)
     avg_logits = logits.logsumexp(dim=0, keepdim=True) - np.log(batch_size) # 1 x num_classes, 
     min_real = torch.finfo(avg_logits.dtype).min
     avg_logits = torch.clamp(avg_logits, min=min_real)
@@ -71,11 +71,10 @@ def get_clip_image_info(
 ):
     with torch.no_grad():
         batch_size = images.shape[0]
-        image_embeds = model.get_image_features(images.to(model.device))
-        image_embeds = image_embeds / image_embeds.norm(dim=-1, keepdim=True)
-
-        logit_scale = model.logit_scale.exp()
-        clip_image_logits = logit_scale * image_embeds @ text_embeds # batch_size x num_classes
+        image_embeds = model.get_image_features(images)
+        image_embeds /= image_embeds.norm(dim=-1, keepdim=True)
+        
+        clip_image_logits = 100. * image_embeds @ text_embeds # batch_size x num_classes
         
         if batch_size == 1:
             loss = softmax_entropy(clip_image_logits)
@@ -120,13 +119,17 @@ def eval(
     }
     
     data_loader = DataLoader(
-        dataset=DataWrapper(dataset, augmix=False), batch_size=1, shuffle=True, pin_memory=torch.cuda.is_available()
+        dataset=DataWrapper(dataset, augmix=True), 
+        batch_size=1, 
+        shuffle=True, 
+        pin_memory=torch.cuda.is_available(), 
+        num_workers=2 # -> 2 进程 4 线程
     )
     
     pbar = tqdm(data_loader, desc="Processed test images: ") 
     with torch.no_grad():
         for x in pbar:
-            torch.cuda.empty_cache()
+            # torch.cuda.empty_cache()
             images, target = x["image"], x["label"]
             images = torch.cat(images, dim=0).to(model.device)
             target = target.to(model.device)
@@ -137,15 +140,16 @@ def eval(
                 text_embeds=text_embeds, 
                 **kwargs
             )
-            
             prop_entropy = float((loss / num_classes).item())
             
             cache.update_pos_cache(pred, image_embeds, loss)
             cache.update_neg_cache(pred, image_embeds, loss, True, prob_map, prop_entropy)
             
             final_logits: torch.Tensor = clip_image_logits.clone()
-            cache_pos_logits = cache.compute_pos_logits(image_embeds, num_classes)
-            cache_neg_logits = cache.compute_neg_logits(image_embeds)
+            if cache.pos_enabled:
+                cache_pos_logits = cache.compute_pos_logits(image_embeds, num_classes)
+            if cache.neg_enabled:
+                cache_neg_logits = cache.compute_neg_logits(image_embeds)
             
             if cache_pos_logits is not None: final_logits += cache_pos_logits
             if cache_neg_logits is not None: final_logits -= cache_neg_logits
