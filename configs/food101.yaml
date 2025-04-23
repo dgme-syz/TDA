@@ -3,7 +3,7 @@
 # --- Positive Cache Configuration ---
 positive:
   enabled: True
-  shot_capacity: 3
+  shot_capacity: 20
   alpha: 1.0
   beta: 1.0 
 

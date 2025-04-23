@@ -22,3 +22,9 @@ rad.json
 TestResults.xml
 *.pyc
 
+
+# local file
+output/
+dataset/
+wandb/
+*.pyc
