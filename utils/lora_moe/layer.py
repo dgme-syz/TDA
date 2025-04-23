@@ -54,6 +54,8 @@ class LoraMoELayer(BaseTunerLayer):
         self.lora_dropout = nn.ModuleDict({})
         self.loramoe_A = nn.ModuleDict({})
         self.loramoe_B = nn.ModuleDict({})
+        self.router_loss = 0
+        self.router_enable = {}
         # soft weight
         self.loramoe_router = nn.ModuleDict({})
         # Mark the weight as unmerged
@@ -140,6 +142,7 @@ class LoraMoELayer(BaseTunerLayer):
         self.num_tasks[adapter_name] = num_tasks
         self.lora_alpha[adapter_name] = lora_alpha
         self.task_id[adapter_name] = None
+        self.router_enable[adapter_name] = False
 
         if lora_dropout > 0.0:
             lora_dropout_layer = nn.Dropout(p=lora_dropout)
@@ -507,7 +510,7 @@ class LoraMoELayer(BaseTunerLayer):
             scaling = self.scaling[active_adapter]
             num_tasks = self.num_tasks[active_adapter]
             task_id = self.task_id[active_adapter]
-
+            router_enable = self.router_enable[active_adapter]
             # Prepare sub-batch
             sub_indices = sub_batch_indices_list[i]
             sub_batch = x[sub_indices]
@@ -515,24 +518,27 @@ class LoraMoELayer(BaseTunerLayer):
             batch_size, seq_len, hidden_dim = sub_batch.shape
 
             sub_batch = dropout(sub_batch)
-            hidden_states = sub_batch.view(-1, hidden_dim)
+            hidden_states = sub_batch[:, 0, :]
 
             # Routing
-            if task_id is None:
+            # if router can be trained
+            if router_enable:
                 router_logits = router(hidden_states)
                 routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
                 del router_logits
-            else:
+            elif task_id is not None:
                 routing_weights = F.one_hot(
-                    torch.tensor([task_id] * (batch_size * seq_len), device=x.device),
+                    torch.tensor([task_id] * (batch_size), device=x.device),
                     num_classes=num_tasks,
                 ).float()
                 top_k = 1
+            else:
+                raise NotImplementedError
 
             routing_weights, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
             routing_weights = routing_weights.to(hidden_states.dtype)
 
-            final_hidden_states = torch.zeros_like(hidden_states)
+            final_hidden_states = torch.zeros_like(sub_batch)
 
             expert_mask = F.one_hot(selected_experts, num_classes=num_tasks).permute(2, 1, 0)
 
@@ -543,10 +549,12 @@ class LoraMoELayer(BaseTunerLayer):
                     continue
                 idx, top_x = torch.where(expert_mask[j])
 
-                current_state = hidden_states[top_x]
-                current_hidden_states = lora_B[j](lora_A[j](current_state)) * routing_weights[top_x, idx, None]
+                current_state = x.index_select(0, top_x) # mini_batch x sequence_length x hidden_dim
+                def lora_fn(state):
+                    return lora_B[i](lora_A[i](state))
 
-                final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
+                out = lora_fn(current_state) * (routing_weights.index_select(0, top_x).gather(1, idx[:, None]))[:, None, :]
+                final_hidden_states.index_add_(0, top_x, out)
 
             final_hidden_states = final_hidden_states.view(batch_size, seq_len, hidden_dim)
             result[sub_indices] += final_hidden_states * scaling
@@ -594,9 +602,10 @@ class LoraMoELayer(BaseTunerLayer):
         for active_adapter in self.active_adapters:
             if activate:
                 self.loramoe_router[active_adapter].weight.requires_grad = True
-                self.task_id[active_adapter] = None
+                self.router_enable[active_adapter] = True
             else:
                 self.loramoe_router[active_adapter].weight.requires_grad = False
+                self.router_enable[active_adapter] = False
 
 # Below code is based on https://github.com/microsoft/LoRA/blob/main/loralib/layers.py
 # and modified to work with PyTorch FSDP
@@ -711,41 +720,51 @@ class Linear(nn.Module, LoraMoELayer):
             scaling = self.scaling[active_adapter]
             num_tasks = self.num_tasks[active_adapter]
             task_id = self.task_id[active_adapter]
+            router_enable = self.router_enable[active_adapter]
             top_k = self.top_k[active_adapter]
             dtype = lora_A[0].weight.dtype
             x = self._cast_input_dtype(x, dtype)
             # print_current_memory_usage("init")
             B, S, H = x.shape
             x = dropout(x)  
-            hidden_states = x.reshape(-1, H)  # Faster than view()
+            hidden_states = x[:, 0, :] # use [CLS] token
 
-            if task_id is None:
-                router_logits = router(hidden_states)
+            end = num_tasks if task_id is None else task_id + 1
+            # if router can be trained
+            if router_enable:
+                router_logits = router(hidden_states)[:, :end]
+                if task_id is not None:
+                    self.router_loss = F.cross_entropy(router_logits, torch.tensor([task_id] * B, device=x.device), reduction="mean")
                 routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
 
-            else:
+            elif task_id is not None:
                 routing_weights = F.one_hot(
-                    torch.full((B * S,), task_id, device=x.device),
+                    torch.full((B,), task_id, device=x.device),
                     num_classes=num_tasks
                 ).float()
                 top_k = 1
+            else:
+                raise NotImplementedError
 
+            # just use previous task id
+            # print(end)
             routing_weights, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
-            routing_weights = routing_weights.to(dtype)
+            routing_weights = routing_weights.to(dtype) #batch_size x top_k
 
-            final_hidden_states = torch.zeros_like(hidden_states)
+            final_hidden_states = torch.zeros_like(x)
             expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=num_tasks).permute(2, 1, 0)
+            # expert_mask: num_tasks x top_k x batch_size
             for i in range(num_tasks):
-                idx, top_x = torch.where(expert_mask[i]) # top_x: batch_size * sequence_length
+                idx, top_x = torch.where(expert_mask[i]) # top_x: mini_batch
                 if top_x.numel() == 0:
                     continue 
 
-                current_state = hidden_states.index_select(0, top_x)
+                current_state = x.index_select(0, top_x) # mini_batch x sequence_length x hidden_dim
                 if not self.use_dora[active_adapter]:
                     def lora_fn(state):
                         return lora_B[i](lora_A[i](state))
 
-                    out = lora_fn(current_state) * routing_weights.index_select(0, top_x).gather(1, idx[:, None])
+                    out = lora_fn(current_state) * (routing_weights.index_select(0, top_x).gather(1, idx[:, None]))[:, None, :]
                     final_hidden_states.index_add_(0, top_x, out)
                 else:
                     base_result = result if isinstance(dropout, nn.Identity) or not self.training else None

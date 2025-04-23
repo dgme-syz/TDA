@@ -371,6 +371,9 @@ def train(
                 target_embeds = text_embeds[:, target]
                 logits_per_text = 100. * image_embeds @ target_embeds
                 loss = clip_loss(logits_per_text)
+            for _, param in model.named_parameters():
+                if hasattr(param, "router_loss"):
+                    loss = loss + param.router_loss
 
             if not torch.isfinite(loss):
                 continue
@@ -426,7 +429,7 @@ def train(
             if (1 - acc) < 0.008:
                 print(f"Early stopping at epoch {epoch} with accuracy {acc:.4f}")
                 break
-            if (epoch + 1) % 5 == 0:
+            if (epoch + 1) % 1 == 0:
                 if eval:
                     if dataset_name == "replay":
                         eval_datasets = ["fgvc", "dtd"]

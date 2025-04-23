@@ -31,7 +31,7 @@ def main(args):
     if args.resume == "":
         config = LoraMoEConfig(
             r=32,
-            top_k=2, 
+            top_k=1, 
             num_tasks=len(args.dataset),
             lora_alpha=16,
             target_modules=target,
@@ -81,7 +81,7 @@ def main(args):
         for name, param in model.named_modules():
             if hasattr(param, "loramoe_router"):
                 param.enable_task(i)
-                param.change_router_state(activate=False)
+                param.change_router_state(activate=True)
         model.print_trainable_parameters()
 
         dataset_name = args.dataset[i]
@@ -96,7 +96,7 @@ def main(args):
         data, label, _ = build_dataset(dataset_name, eval=False)
 
         batch_size = 128
-        total_epochs = 40
+        total_epochs = 1
         if not args.stage1:
             total_epochs = 1
         train(
@@ -186,14 +186,13 @@ def get_args():
         help="Dataset ID for training"
     )
 
-
     args = parser.parse_args()
     args.dataset = args.dataset.split(",")
 
     if args.train_dataset == "":
         args.train_dataset = args.dataset
     if isinstance(args.train_dataset, str):
-        args.train_dataset = [args.train_dataset]
+        args.train_dataset = args.train_dataset.split(",")
 
     if not os.path.exists(args.save_dir):
         os.mkdir(args.save_dir)
