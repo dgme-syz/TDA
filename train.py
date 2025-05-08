@@ -2,33 +2,43 @@ import argparse
 import torch
 from transformers import CLIPModel, CLIPProcessor
 from data import build_dataset
-from utils.tools import extract_clip_text_weights, train
-from utils import CacheModule
-from peft import LoraConfig, get_peft_model
+from utils.tools import train, enable_task, save, load
+
+from peft import get_peft_model
 from utils.lora_moe import LoraMoEConfig
-from peft import PeftModel, PeftConfig
+
 import os
 import wandb
 import random
 import numpy as np
-from utils.combine_datasets import CombDataset
-from safetensors.torch import load_file
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 # python3 train.py --dataset fgvc,caltech101,dtd,eurosat,oxford_flowers,oxford_pets
 seed = 42
+data_type=torch.float32
 def main(args):
+    # torch.autograd.set_detect_anomaly(True)
     model = CLIPModel.from_pretrained(
         "openai/clip-vit-base-patch16", 
         device_map="auto", 
-        torch_dtype=torch.bfloat16, 
-        attn_implementation="flash_attention_2"
+        torch_dtype=data_type,
+        attn_implementation="flash_attention_2" if data_type in [torch.float16, torch.bfloat16] else None
     )
     processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch16")
 
-    target = ["q_proj", "k_proj", "v_proj"]
     # LoRA
-    if args.resume == "":
+    
+    if args.resume != "":
+        model = load(base_model=model, resume_dir=args.resume, dtype=data_type)
+    else:
+        target = []
+        for name, _ in model.named_modules():
+            if any([x in name for x in ["q_proj", "v_proj", "k_proj"]]) and (
+                "text" not in name
+                or any([x in name for x in [".0.", ]])
+            ):
+                _.name = name
+                target.append(name)
         config = LoraMoEConfig(
             r=32,
             top_k=1, 
@@ -39,22 +49,9 @@ def main(args):
             bias="none",
             init_lora_weights="pissa"
         )
-        model = get_peft_model(model, config).to(torch.bfloat16)
-    else:
-        config = PeftConfig.from_pretrained(args.resume)
-        if config.num_tasks != len(args.dataset):
-            config.num_tasks = len(args.dataset)
-        state_dict = load_file(os.path.join(args.resume, "adapter_model.safetensors"))
-        filtered_state_dict = {
-            k: v for k, v in state_dict.items()
-            if 'loramoe_router' not in k
-        }
-        model = get_peft_model(model, config)
-        model.load_state_dict(filtered_state_dict, strict=False)
-        model = model.to(torch.bfloat16)
-
+        model = get_peft_model(model, config).to(data_type)
     print(model)
-    print(config)
+    # print(config)
     run = wandb.init(project="CLIP-MOE", config=None, name="exp")
 
     random.seed(seed)
@@ -74,29 +71,27 @@ def main(args):
         "a photo of the small {}.",
     ]
     
-
+    # save config
+    save(model, save_dir=args.save_dir, task_id=None)
     # Stage1. Train LoRA
-    combdataset = CombDataset()
     for i in range(len(args.dataset)):
-        for name, param in model.named_modules():
-            if hasattr(param, "loramoe_router"):
-                param.enable_task(i)
-                param.change_router_state(activate=True)
+        enable_task(model, i)
         model.print_trainable_parameters()
-
         dataset_name = args.dataset[i]
+        if dataset_name is not None and dataset_name != "replay":
+            eval_datasets.append(dataset_name)
+
         if dataset_name not in args.train_dataset:
             print(f"Skip {dataset_name}")
             continue
-
         print(
             f"Loading dataset: {dataset_name}"
         )
         
         data, label, _ = build_dataset(dataset_name, eval=False)
 
-        batch_size = 128
-        total_epochs = 1
+        batch_size = 64
+        total_epochs = 30
         if not args.stage1:
             total_epochs = 1
         train(
@@ -107,42 +102,15 @@ def main(args):
             processor=processor,
             total_epochs=total_epochs,
             dataset_name=dataset_name,
-            combdataset=combdataset,
             eval_datasets=eval_datasets,
             batch_size=batch_size,
-            collect_only=not args.stage1,
             eval=True,
             save_dir=args.save_dir,
+            task_id=i,
+            data_type=data_type,
         )
-        
-    # model.save_pretrained("lora")    
-    # Stage2. Replay
-
-    if args.stage2:
-        for name, param in model.named_modules():
-            if hasattr(param, "loramoe_router"):
-                param.close_task()
-                param.change_router_state(activate=True)
-                
-        model.print_trainable_parameters()
-        torch.cuda.empty_cache()
-        print(f"Training on {len(combdataset.labels)} classes/images")
-        train(
-            dataset=combdataset, 
-            model=model, 
-            label=combdataset.labels, 
-            template=template,
-            processor=processor,
-            total_epochs=100,
-            eval_datasets=eval_datasets,
-            wrapper=False,
-            batch_size=64,
-            eval=True,
-            accumulation_steps=1,
-            save_dir=args.save_dir,
-            dataset_name="replay",
-        )
-
+        # save router only
+        save(model, args.save_dir, -1, True, "router")
     run.finish()
     
 def get_args():

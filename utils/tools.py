@@ -1,22 +1,24 @@
 from transformers import CLIPModel, CLIPProcessor
-from datasets import ClassLabel
 from typing import List, Union
 import torch
 from datasets import Dataset
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from collections import OrderedDict
-from .cache_module import CacheModule
 from .classes import ClipImageOutput
 import re
 import numpy as np
 from .classes import DataWrapper
-import torch.nn.functional as F
 import torch.nn as nn
 from data import build_dataset
 import os
 import wandb
-
+from torch.amp import autocast, GradScaler
+from peft import PeftModel, get_peft_model
+from peft.utils import id_tensor_storage
+import collections
+from safetensors.torch import save_file as safe_save_file
+from safetensors.torch import load_file
+from .lora_moe import LoraMoEConfig
 
 wordnet_pattern = re.compile(r"n[0-9]{8}")
 
@@ -124,8 +126,6 @@ def eval(
     dataset: Dataset,
     model: CLIPModel,
     text_embeds: torch.Tensor,
-    cache: CacheModule,
-    use_cache: bool, 
     label: list[str],
     **kwargs
 ):
@@ -146,7 +146,6 @@ def eval(
     pbar = tqdm(data_loader, desc="Processed test images: ") 
     with torch.no_grad():
         for x in pbar:
-            # torch.cuda.empty_cache()
             images, target = x["image"], x["label"]
             images = torch.cat(images, dim=0).to(model.device)
             target = target.to(model.device)
@@ -159,20 +158,7 @@ def eval(
             )
             prop_entropy = float((loss / num_classes).item())
             
-            if use_cache:
-                cache.update_pos_cache(pred, image_embeds, loss)
-                cache.update_neg_cache(pred, image_embeds, loss, True, prob_map, prop_entropy)
-            
             final_logits: torch.Tensor = clip_image_logits.clone()
-
-            if use_cache:
-                if cache.pos_enabled:
-                    cache_pos_logits = cache.compute_pos_logits(image_embeds, num_classes)
-                if cache.neg_enabled:
-                    cache_neg_logits = cache.compute_neg_logits(image_embeds)
-            
-                if cache_pos_logits is not None: final_logits += cache_pos_logits
-                if cache_neg_logits is not None: final_logits -= cache_neg_logits
             
             union_pred = final_logits.argmax(dim=-1)
             acc["correct"] += torch.sum(union_pred == target).item()
@@ -190,13 +176,11 @@ def eval_all(
     processor, 
     datasets, 
     template,
-    cache_config="./configs",
-    use_cache=False,
+    wandb_use=True,
+    info=None,
 ):
     model.eval()
     for dataset_name in datasets:
-        torch.cuda.empty_cache()
-        cache = CacheModule.load_from_yaml(os.path.join(cache_config, dataset_name + ".yaml"))   
         print(
             f"Loading dataset: {dataset_name}"
         )
@@ -209,16 +193,28 @@ def eval_all(
         results = eval(
             dataset=data, 
             model=model, 
-            cache=cache, 
             label=label, 
             text_embeds=clip_weights, 
-            use_cache=use_cache
         )
         
         print(
             f"Results for {dataset_name}[ACC]: {results}"
         )      
-        wandb.log({f"{dataset_name}_test_acc": results}, commit=True)
+        if wandb_use:
+            wandb.log({f"{dataset_name}_test_acc": results}, commit=True)
+        if info is not None:
+            print(f"Router choose detail: {info.choose_detail}")
+            if wandb_use:
+                wandb.log(
+                    {
+                        f"{dataset_name}_router_choose_detail": wandb.Histogram(
+                            info.choose_detail, 
+                            num_bins=10
+                        )
+                    }, 
+                    commit=True
+                )
+            info.choose_detail = {}
 
 def load_balancing_loss_func(
     gate_logits: torch.Tensor, num_experts: torch.Tensor = None, top_k=2, attention_mask: torch.Tensor | None = None
@@ -296,7 +292,20 @@ def load_balancing_loss_func(
     overall_loss = torch.sum(tokens_per_expert * router_prob_per_expert.unsqueeze(0))
     return overall_loss * num_experts
 
-from torch.amp import autocast, GradScaler
+def enable_task(model, task_id: int | None = None):
+    for name, param in model.named_modules():
+            if hasattr(param, "loramoe_router"):
+                param.enable_task(task_id)
+                param.change_router_state(activate=False)
+def enable_router(model):
+    for name, param in model.named_modules():
+            if hasattr(param, "loramoe_router"):
+                param.close_task()
+                param.change_router_state(activate=True)
+def zero_router(model, task_id):
+    for name, param in model.named_modules():
+            if hasattr(param, "loramoe_router"):
+                param.zero_router_init(task_id)
 
 def train(
     dataset: Dataset,
@@ -309,15 +318,15 @@ def train(
     dataset_name: str | None = None,
     total_epochs: int = 1000,
     wrapper: bool = True,
-    combdataset=None,
     batch_size: int = 256,
     eval: bool = False,
     accumulation_steps: int = 4,
-    collect_only: bool = False,
+    task_id: int | None = None,
+    data_type: torch.dtype = torch.bfloat16,
     **kwargs
 ):
-    if dataset_name is not None and dataset_name != "replay":
-        eval_datasets.append(dataset_name)
+    if task_id is not None:
+        zero_router(model, task_id)
     if wrapper:
         dataset = DataWrapper(dataset, augmix=False)
     data_loader = DataLoader(
@@ -337,10 +346,16 @@ def train(
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, total_epochs, eta_min=1e-6)
 
     scaler = GradScaler(enabled=False)  
-    amp_dtype = torch.bfloat16 
+    amp_dtype = data_type
 
     for epoch in range(total_epochs):
         model.train()
+        if task_id is not None:
+            for name, param in model.named_modules():
+                if hasattr(param, "loramoe_router"):
+                    param.enable_task(task_id)
+        
+
         res = { "correct": 0, "total": 0, "loss": 0 }
         pbar = tqdm(data_loader, desc="Processed train images: ")
 
@@ -349,12 +364,6 @@ def train(
 
         for x in pbar:
             images, target = x["image"], x["label"]
-            if combdataset is not None:
-                for i in range(target.size(0)):
-                    lab = label[target[i].item()]
-                    if lab not in combdataset.labels:
-                        combdataset.add(images[0][i].cpu().detach(), lab)
-            if collect_only: continue
 
             if not isinstance(images, (tuple, list)):
                 images = (images,)
@@ -371,15 +380,15 @@ def train(
                 target_embeds = text_embeds[:, target]
                 logits_per_text = 100. * image_embeds @ target_embeds
                 loss = clip_loss(logits_per_text)
-            for _, param in model.named_parameters():
+            for _, param in model.named_modules():
                 if hasattr(param, "router_loss"):
                     loss = loss + param.router_loss
+                    param.router_loss = 0
 
             if not torch.isfinite(loss):
                 continue
 
             loss.backward()
-
             accumulation_counter += 1
             if accumulation_counter == accumulation_steps:
                 scaler.unscale_(optimizer)
@@ -416,28 +425,73 @@ def train(
 
             optimizer.zero_grad()
 
-        if not collect_only:
-            scheduler.step()
-            print(f"Epoch {epoch}: Loss: {res['loss'] / res['total']:.4f}, Accuracy: {res['correct'] / res['total']:.4f}")
-            wandb.log(
-                {
-                    f"{dataset_name}_train_loss": res["loss"] / res["total"], f"{dataset_name}_train_acc": res["correct"] / res["total"]
-                }, 
-                commit=True
-            )
-            acc = res["correct"] / res["total"]
-            if (1 - acc) < 0.008:
-                print(f"Early stopping at epoch {epoch} with accuracy {acc:.4f}")
-                break
-            if (epoch + 1) % 1 == 0:
-                if eval:
-                    if dataset_name == "replay":
-                        eval_datasets = ["fgvc", "dtd"]
-                    eval_all(
-                        model=model,
-                        processor=processor,
-                        datasets=eval_datasets,
-                        use_cache=False,
-                        template=template,
-                    )
-                model.save_pretrained(os.path.join(save_dir, f"{dataset_name}_{batch_size}_{total_epochs}"))
+        scheduler.step()
+        print(f"Epoch {epoch}: Loss: {res['loss'] / res['total']:.4f}, Accuracy: {res['correct'] / res['total']:.4f}")
+        wandb.log(
+            {
+                f"{dataset_name}_train_loss": res["loss"] / res["total"], f"{dataset_name}_train_acc": res["correct"] / res["total"]
+            }, 
+            commit=True
+        )
+        acc = res["correct"] / res["total"]
+        if (1 - acc) < 0.008:
+            print(f"Early stopping at epoch {epoch} with accuracy {acc:.4f}")
+            break
+        if (epoch + 1) % 10 == 0:
+            if eval:
+                enable_task(model, None)
+                if dataset_name == "replay":
+                    eval_datasets = ["fgvc", "dtd"]
+                eval_all(
+                    model=model,
+                    processor=processor,
+                    datasets=eval_datasets,
+                    template=template,
+                )
+                if task_id is not None:
+                    enable_task(model, task_id)
+            save(model, save_dir, task_id, True, dataset_name)
+
+def save(model: PeftModel, save_dir: str, task_id: int | None, safe_serialization: bool = True, prefix: str | None = None):
+    if task_id is None:
+        # save config
+        model.peft_config["default"].save_pretrained(save_dir)
+    else:
+        state_dict = model.state_dict()
+        if task_id == -1:
+            # save router
+            to_returns = {k: state_dict[k] for k in state_dict if "loramoe_router" in k}
+        else:
+            to_returns = {
+                k: state_dict[k] for k in state_dict 
+                if any(f"loramoe_{m}.default.{task_id}" in k for m in ["A", "B"])
+            }
+        if safe_serialization:
+            ptrs = collections.defaultdict(list)
+            for name, tensor in to_returns.items():
+                if isinstance(tensor, torch.Tensor):
+                    ptrs[id_tensor_storage(tensor)].append(name)
+                else:
+                    ptrs[id(tensor)].append(name)
+            shared_ptrs = {ptr: names for ptr, names in ptrs.items() if len(names) > 1}
+            for _, names in shared_ptrs.items():
+                # Here we just clone the shared tensors to avoid tensor aliasing which is
+                # not supported in safetensors.
+                for shared_tensor_name in names[1:]:
+                    to_returns[shared_tensor_name] = to_returns[shared_tensor_name].clone()
+        safe_save_file(
+            to_returns,
+            os.path.join(save_dir, f"{prefix}.safetensors"),
+            metadata={"format": "pt"}
+        )
+
+def load(base_model: nn.Module, resume_dir: str, dtype) -> PeftModel:
+    model = get_peft_model(base_model, LoraMoEConfig.from_pretrained(resume_dir)).to(dtype)
+
+    for x in os.listdir(resume_dir):
+        if x.endswith(".safetensors"):
+            print(f"Loading {x}")
+            state_dict = load_file(os.path.join(resume_dir, x))
+            print("unexpected keys: ", model.load_state_dict(state_dict, strict=False)[1])
+            
+    return model.to(dtype)
