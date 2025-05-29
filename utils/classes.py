@@ -105,7 +105,10 @@ class DataWrapper(Dataset):
         
     def __getitem__(self, index):
         item = self.data[index]
-        image, label = read_image(item.impath), item.label
+        if isinstance(item, tuple):
+            image, label = item
+        else:
+            image, label = read_image(item.impath), item.label
         image = self.process(image)
         return {
             "image": image,

@@ -22,7 +22,10 @@ class SUN397(DatasetBase):
         self.image_dir = os.path.join(self.dataset_dir, 'SUN397')
         self.split_path = os.path.join(self.dataset_dir, 'split_zhou_SUN397.json')
 
-        self.template = template
+        self.template = [
+            lambda c: f"a photo of a {c}.",
+            lambda c: f"a photo of the {c}.",
+        ]
 
         test = OxfordPets.read_split(self.split_path, self.image_dir)
         train_x = OxfordPets.read_split(self.split_path, self.image_dir, split="train")

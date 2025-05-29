@@ -5,7 +5,6 @@ from .utils import DatasetBase
 from .oxford_pets import OxfordPets
 
 
-template = ['a photo of a person doing {}.']
 
 class UCF101(DatasetBase):
 
@@ -16,7 +15,9 @@ class UCF101(DatasetBase):
         self.image_dir = os.path.join(self.dataset_dir, 'UCF-101-midframes')
         self.split_path = os.path.join(self.dataset_dir, 'split_zhou_UCF101.json')
 
-        self.template = template
+        self.template = [
+            lambda c: f"a photo of a person doing {c}.",
+        ]
 
         test = OxfordPets.read_split(self.split_path, self.image_dir)
         train_x = OxfordPets.read_split(self.split_path, self.image_dir, split="train")

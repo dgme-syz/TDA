@@ -3,7 +3,6 @@ import os
 from .utils import Datum, DatasetBase
 
 
-template = ['a photo of a {}, a type of aircraft.']
 
 class FGVCAircraft(DatasetBase):
 
@@ -14,7 +13,9 @@ class FGVCAircraft(DatasetBase):
         self.dataset_dir = os.path.join(root, self.dataset_dir)
         self.image_dir = os.path.join(self.dataset_dir, 'images')
 
-        self.template = template
+        self.template = [
+            lambda c: f'a photo of a {c}, a type of aircraft.',
+        ]
 
         classnames = []
         with open(os.path.join(self.dataset_dir, 'variants.txt'), 'r') as f:

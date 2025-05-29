@@ -3,8 +3,6 @@ import os
 from .utils import DatasetBase
 from .oxford_pets import OxfordPets
 
-template = ['a photo of {}, a type of food.']
-
 class Food101(DatasetBase):
 
     dataset_dir = 'food-101'
@@ -14,7 +12,10 @@ class Food101(DatasetBase):
         self.image_dir = os.path.join(self.dataset_dir, 'images')
         self.split_path = os.path.join(self.dataset_dir, 'split_zhou_Food101.json')
         
-        self.template = template
+        self.template = [
+            lambda c: f"a photo of a {c}, a type of food.",
+        ]
+
 
         test = OxfordPets.read_split(self.split_path, self.image_dir)
         train_x = OxfordPets.read_split(self.split_path, self.image_dir, split="train")

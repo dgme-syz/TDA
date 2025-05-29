@@ -16,7 +16,9 @@ class OxfordPets(DatasetBase):
         self.anno_dir = os.path.join(self.dataset_dir, 'annotations')
         self.split_path = os.path.join(self.dataset_dir, 'split_zhou_OxfordPets.json')
 
-        self.template = template
+        self.template = [
+            lambda c: f"a photo of a {c}, a type of pet.",
+        ]
 
         test = self.read_split(self.split_path, self.image_dir)
         train_x = self.read_split(self.split_path, self.image_dir, split="train")

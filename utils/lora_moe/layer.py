@@ -512,6 +512,7 @@ class LoraMoELayer(BaseTunerLayer):
     def enable_task(self, task_id: int) -> None:
         for active_adapter in self.active_adapters:
             num_tasks = self.num_tasks[active_adapter]
+            self.task_id[active_adapter] = task_id
             for i in range(num_tasks):
                 if i != task_id:
                     self.loramoe_A[active_adapter][i].weight.requires_grad = False
@@ -661,52 +662,55 @@ class Linear(nn.Module, LoraMoELayer):
             # print_current_memory_usage("init")
             B, S, H = x.shape
             x = dropout(x)  
-            hidden_states = x[:, 0, :] # use [CLS] token
 
             end = num_tasks# if task_id is None else task_id + 1
             # if router can be trained
-            if task_id is not None:
-                with torch.no_grad():
-                    if self.counts[task_id] + B <= 2000:
-                        temp = hidden_states.sum(dim=0).clone().detach()
-                        new_weight = router.weight[task_id] * self.counts[task_id] + temp
-                        self.counts[task_id] += B
-                        router.weight[task_id].copy_(new_weight / self.counts[task_id])
-                    else:
-                        temp = hidden_states.sum(dim=0).clone().detach()
-                        new_weight = temp
-                        self.counts[task_id] = B
-                        router.weight[task_id].copy_(new_weight / self.counts[task_id])
-  
-            weight = F.normalize(router.weight, dim=-1)
-            # print(routing_weights.shape)
-            sim = F.normalize(hidden_states, dim=-1) @ weight.T
-            routing_weights = sim[:, :end]
-            # if task_id is None:
-            # import random
-            # if (random.random() < 0.01):
-            #     print(routing_weights[0])
-                
+            if "text" not in self.name:
+                hidden_states = x[:, 0, :] # use [CLS] token
+                if task_id is not None:
+                    top_k = min(top_k, task_id + 1)
+                    with torch.no_grad():
+                        if self.counts[task_id] + B <= self.sample:
+                            temp = hidden_states.sum(dim=0).clone().detach()
+                            new_weight = router.weight[task_id] * self.counts[task_id] + temp
+                            self.counts[task_id] += B
+                            router.weight[task_id].copy_(new_weight / self.counts[task_id])
+    
+                weight = F.normalize(router.weight, dim=-1)
+                # print(routing_weights.shape)
+                sim = F.normalize(hidden_states, dim=-1) @ weight.T
 
-            routing_weights, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
+                top_k = min(top_k, num_tasks)
+                routing_weights = sim[:, :end]
+                # trick
+                with torch.no_grad():
+                    count = (routing_weights[0].detach().cpu().numpy() > 0).sum()
+                    top_k = min(top_k, count)
+                    # print(top_k)
+                _, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
+                # print(top_k)
+                expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=num_tasks).permute(2, 1, 0)
             final_hidden_states = torch.zeros_like(x)
-            expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=num_tasks).permute(2, 1, 0)
             # expert_mask: num_tasks x top_k x batch_size
             for i in range(num_tasks):
-                idx, top_x = torch.where(expert_mask[i]) # top_x: mini_batch
+                if "vision" in self.name:
+                    _, top_x = torch.where(expert_mask[i]) # top_x: mini_batch
+                elif "text" in self.name:
+                    # if isinstance(dropout, nn.Identity) or not self.training:
+                    #     print(i, self.text_mode["default"])
+                    if i != self.text_mode["default"]:
+                        continue
+                    top_x = torch.arange(B).to(x.device)
                 if top_x.numel() == 0:
                     continue 
-
-                current_state = x.index_select(0, top_x) # mini_batch x sequence_length x hidden_dim
+                # if "vision" in self.name:
+                #     print(f"Using {top_k} experts for task {i}/{num_tasks} in {self.name}")
+                current_state = x[top_x, :, :] # mini_batch x sequence_length x hidden_dim
                 if not self.use_dora[active_adapter]:
                     def lora_fn(state):
                         return lora_B[i](lora_A[i](state))
-
-                    out = lora_fn(current_state)
-                    # if now is eval mode
-                    if isinstance(dropout, nn.Identity) or not self.training:
-                        # if sim < 0.7, make it zero
-                        out = out * (routing_weights[top_x, i].unsqueeze(-1) > 0.7).float()
+                    r = 1 if "text" in self.name else 1 / top_k
+                    out = r * lora_fn(current_state)
                     final_hidden_states.index_add_(0, top_x, out)
                 else:
                     base_result = result if isinstance(dropout, nn.Identity) or not self.training else None

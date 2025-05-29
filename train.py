@@ -3,7 +3,7 @@ import torch
 from transformers import CLIPModel, CLIPProcessor
 from data import build_dataset
 from utils.tools import train, enable_task, save, load
-
+from data import dataset_list
 from peft import get_peft_model
 from utils.lora_moe import LoraMoEConfig
 
@@ -12,11 +12,20 @@ import wandb
 import random
 import numpy as np
 
+
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 # python3 train.py --dataset fgvc,caltech101,dtd,eurosat,oxford_flowers,oxford_pets
+# python3 train.py --dataset fgvc,caltech101,cifar100,dtd,eurosat,oxford_flowers,food101,mnist,oxford_pets,stanford_cars,sun397
 seed = 42
 data_type=torch.float32
 def main(args):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    # torch.autograd.set_detect_anomaly(mode=True, check_nan=True)
+    torch.manual_seed(seed)
     # torch.autograd.set_detect_anomaly(True)
     model = CLIPModel.from_pretrained(
         "openai/clip-vit-base-patch16", 
@@ -34,10 +43,10 @@ def main(args):
         target = []
         for name, _ in model.named_modules():
             if any([x in name for x in ["q_proj", "v_proj", "k_proj"]]) and (
-                "text" not in name
-                or any([x in name for x in [".0.", ]])
+                # ("text" not in name) or
+                # any([x in name for x in [".8.", ".9.", ".10.", ".11."]])
+                True
             ):
-                _.name = name
                 target.append(name)
         config = LoraMoEConfig(
             r=32,
@@ -50,28 +59,21 @@ def main(args):
             init_lora_weights="pissa"
         )
         model = get_peft_model(model, config).to(data_type)
+        model.class_dict = {}
     print(model)
     # print(config)
     run = wandb.init(project="CLIP-MOE", config=None, name="exp")
 
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-    # torch.autograd.set_detect_anomaly(mode=True, check_nan=True)
-    torch.manual_seed(seed)
     eval_datasets = []
-    template = [
-        "itap of a {}.",
-        "a bad photo of the {}.",
-        "a origami {}.",
-        "a photo of the large {}.",
-        "a {} in a video game.",
-        "art of the {}.",
-        "a photo of the small {}.",
-    ]
     
     # save config
+    model.text_mode = {"default": -1}
+    for name, module in model.named_modules():
+        if hasattr(module, "loramoe_router"):
+            module.name = name
+            if "text" in name:
+                module.text_mode = model.text_mode
+        
     save(model, save_dir=args.save_dir, task_id=None)
     # Stage1. Train LoRA
     for i in range(len(args.dataset)):
@@ -88,19 +90,16 @@ def main(args):
             f"Loading dataset: {dataset_name}"
         )
         
-        data, label, _ = build_dataset(dataset_name, eval=False)
-
-        batch_size = 64
-        total_epochs = 30
-        if not args.stage1:
-            total_epochs = 1
+        data, label, temp = build_dataset(dataset_name, eval=False)
+        for x in label:
+            model.class_dict[x] = i
+        batch_size = 128
         train(
             dataset=data, 
             model=model, 
             label=label, 
-            template=template,
+            template=temp,
             processor=processor,
-            total_epochs=total_epochs,
             dataset_name=dataset_name,
             eval_datasets=eval_datasets,
             batch_size=batch_size,
@@ -156,7 +155,9 @@ def get_args():
 
     args = parser.parse_args()
     args.dataset = args.dataset.split(",")
-
+    for x in args.dataset:
+        if x not in dataset_list:
+            raise ValueError(f"Dataset {x} not found in dataset list.")
     if args.train_dataset == "":
         args.train_dataset = args.dataset
     if isinstance(args.train_dataset, str):

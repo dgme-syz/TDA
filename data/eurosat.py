@@ -29,7 +29,11 @@ class EuroSAT(DatasetBase):
         self.image_dir = os.path.join(self.dataset_dir, '2750')
         self.split_path = os.path.join(self.dataset_dir, 'split_zhou_EuroSAT.json')
         
-        self.template = template
+        self.template = [
+            lambda c: f"a centered satellite photo of {c}.",
+            lambda c: f"a centered satellite photo of a {c}.",
+            lambda c: f"a centered satellite photo of the {c}.",
+        ]
 
         test = OxfordPets.read_split(self.split_path, self.image_dir)
         train = OxfordPets.read_split(self.split_path, self.image_dir, split='train')

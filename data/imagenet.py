@@ -170,14 +170,6 @@ imagenet_classes = ["tench", "goldfish", "great white shark", "tiger shark", "ha
                         "rose hip", "horse chestnut seed", "coral fungus", "agaric", "gyromitra", "stinkhorn mushroom",
                         "earth star fungus", "hen of the woods mushroom", "bolete", "corn cob", "toilet paper"]
 
-imagenet_templates = ["itap of a {}.",
-                        "a bad photo of the {}.",
-                        "a origami {}.",
-                        "a photo of the large {}.",
-                        "a {} in a video game.",
-                        "art of the {}.",
-                        "a photo of the small {}."]
-
 class ImageNet():
 
     dataset_dir = 'imagenet'
@@ -191,7 +183,15 @@ class ImageNet():
         
         self.test = torchvision.datasets.ImageNet(self.image_dir, split='val', transform=test_preprocess)
         
-        self.template = imagenet_templates
+        self.template = [
+            lambda c: f"itap of a {c}.",
+            lambda c: f"a bad photo of the {c}.",
+            lambda c: f"a origami {c}.",
+            lambda c: f"a photo of the large {c}.",
+            lambda c: f"a {c} in a video game.",
+            lambda c: f"art of the {c}.",
+            lambda c: f"a photo of the small {c}."
+        ]
         self.classnames = imagenet_classes
     
     def read_classnames(text_file):

@@ -4,8 +4,6 @@ from .utils import DatasetBase
 from .oxford_pets import OxfordPets
 
 
-template = ['{} texture.']
-
 class DescribableTextures(DatasetBase):
 
     dataset_dir = 'dtd'
@@ -15,7 +13,16 @@ class DescribableTextures(DatasetBase):
         self.image_dir = os.path.join(self.dataset_dir, 'images')
         self.split_path = os.path.join(self.dataset_dir, 'split_zhou_DescribableTextures.json')
 
-        self.template = template
+        self.template = [
+            lambda c: f'a photo of a {c} texture.',
+            lambda c: f'a photo of a {c} pattern.',
+            lambda c: f'a photo of a {c} thing.',
+            lambda c: f'a photo of a {c} object.',
+            lambda c: f'a photo of the {c} texture.',
+            lambda c: f'a photo of the {c} pattern.',
+            lambda c: f'a photo of the {c} thing.',
+            lambda c: f'a photo of the {c} object.',
+        ]
 
         test = OxfordPets.read_split(self.split_path, self.image_dir)
         train_x = OxfordPets.read_split(self.split_path, self.image_dir, split="train")

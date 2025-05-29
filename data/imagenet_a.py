@@ -4,15 +4,6 @@ from .utils import Datum, DatasetBase, listdir_nohidden
 from .imagenet import ImageNet
 
 TO_BE_IGNORED = ["README.txt"]
-template = [
-    "itap of a {}.",
-    "a bad photo of the {}.",
-    "a origami {}.",
-    "a photo of the large {}.",
-    "a {} in a video game.",
-    "art of the {}.",
-    "a photo of the small {}.",
-]
 
 class ImageNetA(DatasetBase):
     """ImageNet-A(dversarial).
@@ -26,7 +17,15 @@ class ImageNetA(DatasetBase):
         root = os.path.abspath(os.path.expanduser(root))
         self.dataset_dir = os.path.join(root, self.dataset_dir)
         self.image_dir = os.path.join(self.dataset_dir, "imagenet-a")
-        self.template = template
+        self.template = [
+            lambda c: f"itap of a {c}.",
+            lambda c: f"a bad photo of the {c}.",
+            lambda c: f"a origami {c}.",
+            lambda c: f"a photo of the large {c}.",
+            lambda c: f"a {c} in a video game.",
+            lambda c: f"art of the {c}.",
+            lambda c: f"a photo of the small {c}.",
+        ]
 
         text_file = os.path.join(self.dataset_dir, "classnames.txt")
         classnames = ImageNet.read_classnames(text_file)

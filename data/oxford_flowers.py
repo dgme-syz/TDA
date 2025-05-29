@@ -4,7 +4,6 @@ from .oxford_pets import OxfordPets
 from .utils import DatasetBase
 
 
-template = ['a photo of a {}, a type of flower.']
 
 class OxfordFlowers(DatasetBase):
 
@@ -17,7 +16,9 @@ class OxfordFlowers(DatasetBase):
         self.lab2cname_file = os.path.join(self.dataset_dir, 'cat_to_name.json')
         self.split_path = os.path.join(self.dataset_dir, 'split_zhou_OxfordFlowers.json')
 
-        self.template = template
+        self.template = [
+            lambda c: f"a photo of a {c}, a type of flower.",
+        ]
 
         test = OxfordPets.read_split(self.split_path, self.image_dir)
         train_x = OxfordPets.read_split(self.split_path, self.image_dir, split="train")

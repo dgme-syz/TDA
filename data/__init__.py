@@ -12,7 +12,8 @@ from .imagenetv2 import ImageNetV2
 from .imagenet_a import ImageNetA
 from .imagenet_r import ImageNetR
 from .imagenet_sketch import ImageNetSketch
-
+from .cifar100 import Cifar100
+from .mnist import MNIST
 
 dataset_list = {
     "oxford_pets": OxfordPets,
@@ -29,6 +30,8 @@ dataset_list = {
     "imagenet-v": ImageNetV2,
     "imagenet-r": ImageNetR,
     "imagenet-s": ImageNetSketch,
+    "cifar100": Cifar100,
+    "mnist": MNIST,
 }
 
 
@@ -38,6 +41,6 @@ def build_dataset(dataset, root_path=None, eval=True):
     data = dataset_list[dataset](root_path)
     
     outs = (data.test, ) if eval else (data.train_x, )
-    outs += (data.classnames, data.template, )
+    outs += (data.classnames, data.template[0], )
     return outs
 
